@@ -78,6 +78,7 @@ class DBManager:
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT TRUE,
+                is_admin BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -244,16 +245,27 @@ class DBManager:
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN is_bargain INTEGER DEFAULT 0")
                 logger.info("orders 表 is_bargain 列添加完成")
 
-            # 检查并添加收货人信息列
+            # 检查并添加收货人信息列（旧库可能只补齐了部分列，需要逐列检查）
             try:
-                self._execute_sql(cursor, "SELECT receiver_name FROM orders LIMIT 1")
-            except sqlite3.OperationalError:
-                # receiver_name 列不存在，需要添加
-                logger.info("正在为 orders 表添加收货人信息列...")
-                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_name TEXT DEFAULT ''")
-                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_phone TEXT DEFAULT ''")
-                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_address TEXT DEFAULT ''")
-                logger.info("orders 表收货人信息列添加完成")
+                cursor.execute("PRAGMA table_info(orders)")
+                order_columns = [column[1] for column in cursor.fetchall()]
+
+                receiver_cols = {
+                    'receiver_name': "ALTER TABLE orders ADD COLUMN receiver_name TEXT DEFAULT ''",
+                    'receiver_phone': "ALTER TABLE orders ADD COLUMN receiver_phone TEXT DEFAULT ''",
+                    'receiver_address': "ALTER TABLE orders ADD COLUMN receiver_address TEXT DEFAULT ''",
+                    'receiver_city': "ALTER TABLE orders ADD COLUMN receiver_city TEXT DEFAULT ''",
+                }
+
+                missing = [c for c in receiver_cols.keys() if c not in order_columns]
+                if missing:
+                    logger.info(f"正在为 orders 表添加收货信息列: {missing}...")
+                    for col in missing:
+                        self._execute_sql(cursor, receiver_cols[col])
+                    logger.info("orders 表收货信息列补齐完成")
+
+            except Exception as e:
+                logger.error(f"检查/补齐 orders 收货信息列失败: {e}")
 
             # 检查并添加 version 列（用于乐观锁）
             try:
@@ -469,7 +481,15 @@ class DBManager:
             )
             ''')
 
-            # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
+            # 检查并添加 is_admin 列
+            try:
+                self._execute_sql(cursor, "SELECT is_admin FROM users LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 users 表添加 is_admin 列...")
+                self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE")
+                logger.info("users 表 is_admin 列添加完成")
+
+            # 插入默认系统设置（不包括管理员密码，由CLI初始化）
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
             ('theme_color', 'blue', '主题颜色'),
@@ -629,7 +649,7 @@ class DBManager:
 
             if current_version == "1.0":
                 logger.info("开始升级数据库到版本1.0...")
-                self.update_admin_user_id(cursor)
+                # 安全基线：不再在数据库初始化/升级时自动创建默认管理员账号
                 self.set_system_setting("db_version", "1.0", "数据库版本号")
                 logger.info("数据库升级到版本1.0完成")
             
@@ -675,155 +695,14 @@ class DBManager:
         except Exception as e:
             logger.error(f"数据库版本检查或升级失败: {e}")
             raise
-            
-    def update_admin_user_id(self, cursor):
-        """更新admin用户ID"""
+
+    def is_system_initialized(self) -> bool:
+        """判断系统是否已完成初始化（至少存在 admin 用户）"""
         try:
-            logger.info("开始更新admin用户ID...")
-            # 创建默认admin用户（只在首次初始化时创建）
-            cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', ('admin',))
-            admin_exists = cursor.fetchone()[0] > 0
-
-            if not admin_exists:
-                # 首次创建admin用户，设置默认密码
-                default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
-                cursor.execute('''
-                INSERT INTO users (username, email, password_hash) VALUES
-                ('admin', 'admin@localhost', ?)
-                ''', (default_password_hash,))
-                logger.info("创建默认admin用户，密码: admin123")
-
-            # 获取admin用户ID，用于历史数据绑定
-            self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
-            admin_user = cursor.fetchone()
-            if admin_user:
-                admin_user_id = admin_user[0]
-
-                # 将历史cookies数据绑定到admin用户（如果user_id列不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT user_id FROM cookies LIMIT 1")
-                except sqlite3.OperationalError:
-                    # user_id列不存在，需要添加并更新历史数据
-                    self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN user_id INTEGER")
-                    self._execute_sql(cursor, "UPDATE cookies SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
-                else:
-                    # user_id列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE cookies SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
-
-                # 为cookies表添加auto_confirm字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT auto_confirm FROM cookies LIMIT 1")
-                except sqlite3.OperationalError:
-                    # auto_confirm列不存在，需要添加并设置默认值
-                    self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN auto_confirm INTEGER DEFAULT 1")
-                    self._execute_sql(cursor, "UPDATE cookies SET auto_confirm = 1 WHERE auto_confirm IS NULL")
-                else:
-                    # auto_confirm列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE cookies SET auto_confirm = 1 WHERE auto_confirm IS NULL")
-
-                # 为delivery_rules表添加user_id字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT user_id FROM delivery_rules LIMIT 1")
-                except sqlite3.OperationalError:
-                    # user_id列不存在，需要添加并更新历史数据
-                    self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN user_id INTEGER")
-                    self._execute_sql(cursor, "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
-                else:
-                    # user_id列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
-
-                # 为notification_channels表添加user_id字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT user_id FROM notification_channels LIMIT 1")
-                except sqlite3.OperationalError:
-                    # user_id列不存在，需要添加并更新历史数据
-                    self._execute_sql(cursor, "ALTER TABLE notification_channels ADD COLUMN user_id INTEGER")
-                    self._execute_sql(cursor, "UPDATE notification_channels SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
-                else:
-                    # user_id列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE notification_channels SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
-
-                # 为email_verifications表添加type字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT type FROM email_verifications LIMIT 1")
-                except sqlite3.OperationalError:
-                    # type列不存在，需要添加并更新历史数据
-                    self._execute_sql(cursor, "ALTER TABLE email_verifications ADD COLUMN type TEXT DEFAULT 'register'")
-                    self._execute_sql(cursor, "UPDATE email_verifications SET type = 'register' WHERE type IS NULL")
-                else:
-                    # type列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE email_verifications SET type = 'register' WHERE type IS NULL")
-
-                # 为cards表添加多规格字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT is_multi_spec FROM cards LIMIT 1")
-                except sqlite3.OperationalError:
-                    # 多规格字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN is_multi_spec BOOLEAN DEFAULT FALSE")
-                    self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN spec_name TEXT")
-                    self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN spec_value TEXT")
-                    logger.info("为cards表添加多规格字段")
-
-                # 为item_info表添加多规格字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT is_multi_spec FROM item_info LIMIT 1")
-                except sqlite3.OperationalError:
-                    # 多规格字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN is_multi_spec BOOLEAN DEFAULT FALSE")
-                    logger.info("为item_info表添加多规格字段")
-
-                # 为item_info表添加多数量发货字段（如果不存在）
-                try:
-                    self._execute_sql(cursor, "SELECT multi_quantity_delivery FROM item_info LIMIT 1")
-                except sqlite3.OperationalError:
-                    # 多数量发货字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN multi_quantity_delivery BOOLEAN DEFAULT FALSE")
-                    logger.info("为item_info表添加多数量发货字段")
-
-                # 检查orders表是否有is_bargain字段
-                try:
-                    self._execute_sql(cursor, "SELECT is_bargain FROM orders LIMIT 1")
-                except sqlite3.OperationalError:
-                    # is_bargain字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN is_bargain INTEGER DEFAULT 0")
-                    logger.info("为orders表添加is_bargain字段")
-
-                # 检查orders表是否有receiver_name字段
-                try:
-                    self._execute_sql(cursor, "SELECT receiver_name FROM orders LIMIT 1")
-                except sqlite3.OperationalError:
-                    # receiver_name字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_name TEXT")
-                    logger.info("为orders表添加receiver_name字段")
-
-                # 检查orders表是否有receiver_phone字段
-                try:
-                    self._execute_sql(cursor, "SELECT receiver_phone FROM orders LIMIT 1")
-                except sqlite3.OperationalError:
-                    # receiver_phone字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_phone TEXT")
-                    logger.info("为orders表添加receiver_phone字段")
-
-                # 检查orders表是否有receiver_address字段
-                try:
-                    self._execute_sql(cursor, "SELECT receiver_address FROM orders LIMIT 1")
-                except sqlite3.OperationalError:
-                    # receiver_address字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_address TEXT")
-                    logger.info("为orders表添加receiver_address字段")
-
-                # 检查orders表是否有system_shipped字段（系统是否已发货）
-                try:
-                    self._execute_sql(cursor, "SELECT system_shipped FROM orders LIMIT 1")
-                except sqlite3.OperationalError:
-                    # system_shipped字段不存在，需要添加
-                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0")
-                    logger.info("为orders表添加system_shipped字段")
-
-                # 处理keywords表的唯一约束问题
-                # 由于SQLite不支持直接修改约束，我们需要重建表
-                self._migrate_keywords_table_constraints(cursor)
-
+            admin_user = self.get_user_by_username('admin')
+            return bool(admin_user)
+        except Exception:
+            return False
             self.conn.commit()
             logger.info(f"admin用户ID更新完成")
         except Exception as e:
@@ -1272,10 +1151,12 @@ class DBManager:
                     if existing:
                         user_id = existing[0]
                     else:
-                        # 获取admin用户ID作为默认值
+                        # 获取admin用户ID作为默认值（系统未初始化时不应兜底为 1）
                         self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
                         admin_user = cursor.fetchone()
-                        user_id = admin_user[0] if admin_user else 1
+                        if not admin_user:
+                            raise RuntimeError('系统未初始化：admin 用户不存在，请先执行 init_admin.py 初始化管理员')
+                        user_id = admin_user[0]
 
                 self._execute_sql(cursor,
                     "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
@@ -1476,10 +1357,12 @@ class DBManager:
                     
                     # 如果没有提供user_id，尝试从现有记录获取，否则使用admin用户ID
                     if user_id is None:
-                        # 获取admin用户ID作为默认值
+                        # 获取admin用户ID作为默认值（系统未初始化时不应兜底为 1）
                         self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
                         admin_user = cursor.fetchone()
-                        user_id = admin_user[0] if admin_user else 1
+                        if not admin_user:
+                            raise RuntimeError('系统未初始化：admin 用户不存在，请先执行 init_admin.py 初始化管理员')
+                        user_id = admin_user[0]
                     
                     # 构建插入语句
                     insert_fields = ['id', 'value', 'user_id']
@@ -2620,7 +2503,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, is_admin, created_at, updated_at
                 FROM users WHERE username = ?
                 ''', (username,))
 
@@ -2632,8 +2515,9 @@ class DBManager:
                         'email': row[2],
                         'password_hash': row[3],
                         'is_active': row[4],
-                        'created_at': row[5],
-                        'updated_at': row[6]
+                        'is_admin': bool(row[5]),
+                        'created_at': row[6],
+                        'updated_at': row[7]
                     }
                 return None
             except Exception as e:
@@ -2646,7 +2530,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, is_admin, created_at, updated_at
                 FROM users WHERE email = ?
                 ''', (email,))
 
@@ -2658,8 +2542,9 @@ class DBManager:
                         'email': row[2],
                         'password_hash': row[3],
                         'is_active': row[4],
-                        'created_at': row[5],
-                        'updated_at': row[6]
+                        'is_admin': bool(row[5]),
+                        'created_at': row[6],
+                        'updated_at': row[7]
                     }
                 return None
             except Exception as e:

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
@@ -17,6 +17,7 @@ import uvicorn
 import pandas as pd
 import io
 import asyncio
+import sqlite3
 from collections import defaultdict
 
 import cookie_manager
@@ -42,12 +43,112 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
-SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
-TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
 
-# HTTP Bearer认证
-security = HTTPBearer(auto_error=False)
+# Session Cookie 配置（安全优先）
+SESSION_COOKIE_NAME = "session"
+SESSION_EXPIRE_SECONDS = 24 * 60 * 60
+
+
+def _get_db_path() -> str:
+    return os.getenv('DB_PATH', 'data/xianyu_data.db')
+
+
+def _init_sessions_table_if_needed():
+    conn = sqlite3.connect(_get_db_path(), check_same_thread=False)
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0,
+            expires_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        ''')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _create_session(user: Dict[str, Any]) -> str:
+    _init_sessions_table_if_needed()
+    session_id = secrets.token_urlsafe(32)
+    now = int(time.time())
+    expires_at = now + SESSION_EXPIRE_SECONDS
+
+    conn = sqlite3.connect(_get_db_path(), check_same_thread=False)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO sessions (session_id, user_id, username, is_admin, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                int(user['id']),
+                str(user['username']),
+                1 if user.get('is_admin') else 0,
+                int(expires_at),
+                int(now),
+            ),
+        )
+        conn.commit()
+        return session_id
+    finally:
+        conn.close()
+
+
+def _delete_session(session_id: str) -> None:
+    _init_sessions_table_if_needed()
+    conn = sqlite3.connect(_get_db_path(), check_same_thread=False)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    if not session_id:
+        return None
+
+    _init_sessions_table_if_needed()
+    conn = sqlite3.connect(_get_db_path(), check_same_thread=False)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT session_id, user_id, username, is_admin, expires_at FROM sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        now = int(time.time())
+        expires_at = int(row[4])
+        if expires_at <= now:
+            cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+            return None
+
+        return {
+            'session_id': row[0],
+            'user_id': int(row[1]),
+            'username': row[2],
+            'is_admin': bool(row[3]),
+            'timestamp': float(now),
+        }
+    finally:
+        conn.close()
+
+
+def get_current_user_from_session_cookie(session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME)) -> Optional[Dict[str, Any]]:
+    return _get_session(session)
+
+
+# ==================== Cookie Session Auth (Phase 1) ====================
+# 已切换为 HttpOnly Cookie Session；不再支持 Bearer token。
 
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
@@ -176,45 +277,23 @@ class VerifyCaptchaResponse(BaseModel):
     message: str
 
 
-def generate_token() -> str:
-    """生成随机token"""
-    return secrets.token_urlsafe(32)
+def verify_token() -> Optional[Dict[str, Any]]:
+    """已移除：Bearer token 认证不再支持"""
+    return None
 
 
-def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict[str, Any]]:
-    """验证token并返回用户信息"""
-    if not credentials:
-        return None
-
-    token = credentials.credentials
-    if token not in SESSION_TOKENS:
-        return None
-
-    token_data = SESSION_TOKENS[token]
-
-    # 检查token是否过期
-    if time.time() - token_data['timestamp'] > TOKEN_EXPIRE_TIME:
-        del SESSION_TOKENS[token]
-        return None
-
-    return token_data
-
-
-def verify_admin_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Dict[str, Any]:
-    """验证管理员token"""
-    user_info = verify_token(credentials)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="未授权访问")
-
-    # 检查是否是管理员
-    if user_info['username'] != ADMIN_USERNAME:
-        raise HTTPException(status_code=403, detail="需要管理员权限")
-
+def verify_session(user_info: Optional[Dict[str, Any]] = Depends(get_current_user_from_session_cookie)) -> Optional[Dict[str, Any]]:
+    """验证 HttpOnly Cookie Session 并返回用户信息"""
     return user_info
 
 
-def require_auth(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
-    """需要认证的依赖，返回用户信息"""
+def verify_admin_token() -> Dict[str, Any]:
+    """已移除：Bearer token 管理员认证不再支持"""
+    raise HTTPException(status_code=410, detail="Bearer token 认证已移除")
+
+
+def require_auth(user_info: Optional[Dict[str, Any]] = Depends(verify_session)):
+    """需要认证的依赖，返回用户信息（Cookie Session）"""
     if not user_info:
         raise HTTPException(status_code=401, detail="未授权访问")
     return user_info
@@ -225,8 +304,8 @@ def get_current_user(user_info: Dict[str, Any] = Depends(require_auth)) -> Dict[
     return user_info
 
 
-def get_current_user_optional(user_info: Optional[Dict[str, Any]] = Depends(verify_token)) -> Optional[Dict[str, Any]]:
-    """获取当前用户信息（可选，不强制要求登录）"""
+def get_current_user_optional(user_info: Optional[Dict[str, Any]] = Depends(verify_session)) -> Optional[Dict[str, Any]]:
+    """获取当前用户信息（可选，不强制要求登录；Cookie Session）"""
     return user_info
 
 
@@ -239,7 +318,7 @@ def get_user_log_prefix(user_info: Dict[str, Any] = None) -> str:
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """要求管理员权限"""
-    if current_user['username'] != 'admin':
+    if not current_user.get('is_admin', False):
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return current_user
 
@@ -370,7 +449,8 @@ app.mount('/static', StaticFiles(directory=static_dir), name='static')
 # 挂载 /assets 路径，指向 static/assets 目录
 # 这样访问 /assets/xxx.js 时会正确映射到 static_dir/assets/xxx.js
 assets_dir = os.path.join(static_dir, 'assets')
-app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
+if os.path.exists(assets_dir):
+    app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
 
 # 确保图片上传目录存在
 uploads_dir = os.path.join(static_dir, 'uploads', 'images')
@@ -451,6 +531,12 @@ async def login_route():
     return await serve_frontend()
 
 
+# 初始化页面路由
+@app.get('/init', response_class=HTMLResponse)
+async def init_route():
+    return await serve_frontend()
+
+
 # 注册页面路由
 @app.get('/register.html', response_class=HTMLResponse)
 async def register_page():
@@ -483,11 +569,6 @@ async def register_page():
 
     return await serve_frontend()
 
-@app.get('/register', response_class=HTMLResponse)
-async def register_route():
-    return await serve_frontend()
-
-
 # 注意：不要在这里定义 /admin 或 /admin/{path} 路由
 # 因为后端有 /admin/users, /admin/logs 等 API 路由
 # 前端 SPA 通过根路由 / 加载，由 React Router 处理客户端路由
@@ -509,14 +590,12 @@ async def login(request: LoginRequest):
         if db_manager.verify_user_password(request.username, request.password):
             user = db_manager.get_user_by_username(request.username)
             if user:
-                # 生成token
-                token = generate_token()
-                SESSION_TOKENS[token] = {
-                    'user_id': user['id'],
+                # 创建 Cookie Session
+                session_id = _create_session({
+                    'id': user['id'],
                     'username': user['username'],
-                    'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
-                    'timestamp': time.time()
-                }
+                    'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+                })
 
                 # 区分管理员和普通用户的日志
                 if user['username'] == ADMIN_USERNAME:
@@ -524,14 +603,24 @@ async def login(request: LoginRequest):
                 else:
                     logger.info(f"【{user['username']}#{user['id']}】登录成功")
 
-                return LoginResponse(
+                resp = JSONResponse(content=LoginResponse(
                     success=True,
-                    token=token,
+                    token=None,
                     message="登录成功",
                     user_id=user['id'],
                     username=user['username'],
-                    is_admin=(user['username'] == ADMIN_USERNAME)
+                    is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
+                ).model_dump())
+                resp.set_cookie(
+                    key=SESSION_COOKIE_NAME,
+                    value=session_id,
+                    httponly=True,
+                    samesite='lax',
+                    secure=False,
+                    max_age=SESSION_EXPIRE_SECONDS,
+                    path='/',
                 )
+                return resp
 
         logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
         return LoginResponse(
@@ -545,25 +634,33 @@ async def login(request: LoginRequest):
 
         user = db_manager.get_user_by_email(request.email)
         if user and db_manager.verify_user_password(user['username'], request.password):
-            # 生成token
-            token = generate_token()
-            SESSION_TOKENS[token] = {
-                'user_id': user['id'],
+            # 创建 Cookie Session
+            session_id = _create_session({
+                'id': user['id'],
                 'username': user['username'],
-                'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
-                'timestamp': time.time()
-            }
+                'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+            })
 
             logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
 
-            return LoginResponse(
+            resp = JSONResponse(content=LoginResponse(
                 success=True,
-                token=token,
+                token=None,
                 message="登录成功",
                 user_id=user['id'],
                 username=user['username'],
-                is_admin=(user['username'] == ADMIN_USERNAME)
+                is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
+            ).model_dump())
+            resp.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=session_id,
+                httponly=True,
+                samesite='lax',
+                secure=False,
+                max_age=SESSION_EXPIRE_SECONDS,
+                path='/',
             )
+            return resp
 
         logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
         return LoginResponse(
@@ -592,25 +689,33 @@ async def login(request: LoginRequest):
                 message="用户不存在"
             )
 
-        # 生成token
-        token = generate_token()
-        SESSION_TOKENS[token] = {
-            'user_id': user['id'],
+        # 创建 Cookie Session
+        session_id = _create_session({
+            'id': user['id'],
             'username': user['username'],
-            'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
-            'timestamp': time.time()
-        }
+            'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+        })
 
         logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
 
-        return LoginResponse(
+        resp = JSONResponse(content=LoginResponse(
             success=True,
-            token=token,
+            token=None,
             message="登录成功",
             user_id=user['id'],
             username=user['username'],
-            is_admin=(user['username'] == ADMIN_USERNAME)
+            is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
+        ).model_dump())
+        resp.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session_id,
+            httponly=True,
+            samesite='lax',
+            secure=False,
+            max_age=SESSION_EXPIRE_SECONDS,
+            path='/',
         )
+        return resp
 
     else:
         return LoginResponse(
@@ -621,37 +726,48 @@ async def login(request: LoginRequest):
 
 # 验证token接口
 @app.get('/verify')
-async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
+async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_session)):
+    # 如果系统尚未初始化（没有 admin 用户），前端需要显示初始化引导
+    from db_manager import db_manager
+    initialized = db_manager.is_system_initialized()
+
     if user_info:
         return {
             "authenticated": True,
             "user_id": user_info['user_id'],
             "username": user_info['username'],
-            "is_admin": user_info['username'] == ADMIN_USERNAME
+            "is_admin": bool(user_info.get('is_admin', False)),
+            "initialized": initialized,
         }
-    return {"authenticated": False}
+
+    return {
+        "authenticated": False,
+        "initialized": initialized,
+    }
 
 
 # 登出接口
 @app.post('/logout')
-async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    if credentials and credentials.credentials in SESSION_TOKENS:
-        del SESSION_TOKENS[credentials.credentials]
-    return {"message": "已登出"}
+async def logout(response: Response, session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME)):
+    if session:
+        _delete_session(session)
+    response = JSONResponse(content={"message": "已登出"})
+    response.delete_cookie(key=SESSION_COOKIE_NAME, path='/')
+    return response
 
 
 # 修改管理员密码接口
 @app.post('/change-admin-password')
-async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
+async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
     from db_manager import db_manager
 
     try:
         # 验证当前密码（使用用户表验证）
-        if not db_manager.verify_user_password('admin', request.current_password):
+        if not db_manager.verify_user_password(ADMIN_USERNAME, request.current_password):
             return {"success": False, "message": "当前密码错误"}
 
         # 更新密码（使用用户表更新）
-        success = db_manager.update_user_password('admin', request.new_password)
+        success = db_manager.update_user_password(ADMIN_USERNAME, request.new_password)
 
         if success:
             logger.info(f"【admin#{admin_user['user_id']}】管理员密码修改成功")
@@ -695,30 +811,11 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
 
 
 # 检查是否使用默认密码
+# 安全原因：不再支持“默认口令检查”接口。默认口令会导致高危风险，且该接口曾在日志中泄露口令。
+# ���需管理员初始化/重置，请通过受控的初始化流程或管理员修改密码接口完成。
 @app.get('/api/check-default-password')
 async def check_default_password(current_user: Dict[str, Any] = Depends(get_current_user)):
-    from db_manager import db_manager
-
-    try:
-        username = current_user.get('username')
-        is_admin = current_user.get('is_admin', False)
-        
-        logger.info(f"检查默认密码: username={username}, is_admin={is_admin}")
-        
-        # 只检查admin用户
-        if not is_admin or username != 'admin':
-            logger.info(f"非admin用户，跳过检查")
-            return {"using_default": False}
-
-        # 检查是否使用默认密码
-        using_default = db_manager.verify_user_password('admin', DEFAULT_ADMIN_PASSWORD)
-        logger.info(f"默认密码检查结果: {using_default}, DEFAULT_ADMIN_PASSWORD={DEFAULT_ADMIN_PASSWORD}")
-        
-        return {"using_default": using_default}
-
-    except Exception as e:
-        logger.error(f"检查默认密码异常: {e}")
-        return {"using_default": False}
+    raise HTTPException(status_code=404, detail="接口已移除")
 
 
 # 生成图形验证码接口
@@ -1099,10 +1196,6 @@ async def register(request: RegisterRequest):
 
 # ------------------------- 发送消息接口 -------------------------
 
-# 固定的API秘钥（生产环境中应该从配置文件或环境变量读取）
-# 注意：现在从系统设置中读取QQ回复消息秘钥
-API_SECRET_KEY = "xianyu_api_secret_2024"  # 保留作为后备
-
 class SendMessageRequest(BaseModel):
     api_key: str
     cookie_id: str
@@ -1117,21 +1210,22 @@ class SendMessageResponse(BaseModel):
 
 
 def verify_api_key(api_key: str) -> bool:
-    """验证API秘钥"""
+    """验证API秘钥
+
+    安全基线：必须显式配置（系统设置/环境变量），不再允许硬编码后备key。
+    """
     try:
-        # 从系统设置中获取QQ回复消息秘钥
         from db_manager import db_manager
         qq_secret_key = db_manager.get_system_setting('qq_reply_secret_key')
 
-        # 如果系统设置中没有配置，使用默认值
         if not qq_secret_key:
-            qq_secret_key = API_SECRET_KEY
+            logger.error("qq_reply_secret_key 未配置，拒绝请求")
+            return False
 
         return api_key == qq_secret_key
     except Exception as e:
         logger.error(f"验证API秘钥时发生异常: {e}")
-        # 异常情况下使用默认秘钥验证
-        return api_key == API_SECRET_KEY
+        return False
 
 
 @app.post('/send-message', response_model=SendMessageResponse)
@@ -1158,14 +1252,6 @@ async def send_message_api(request: SendMessageRequest):
             return SendMessageResponse(
                 success=False,
                 message="API秘钥不能为空"
-            )
-
-        # 特殊测试秘钥处理
-        if cleaned_api_key == "zhinina_test_key":
-            logger.info("使用测试秘钥，直接返回成功")
-            return SendMessageResponse(
-                success=True,
-                message="接口验证成功"
             )
 
         # 验证API秘钥
@@ -1345,31 +1431,33 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 @app.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取所有Cookie的详细信息（包括值和状态）"""
+    """获取所有账号的非敏感信息
+
+    安全基线：禁止返回闲鱼Cookie明文、账号密码明文。
+    """
     if cookie_manager.manager is None:
         return []
 
-    # 获取当前用户的cookies
     user_id = current_user['user_id']
     from db_manager import db_manager
     user_cookies = db_manager.get_all_cookies(user_id)
 
     result = []
-    for cookie_id, cookie_value in user_cookies.items():
+    for cookie_id in user_cookies.keys():
         cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
-        # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
 
         result.append({
             'id': cookie_id,
-            'value': cookie_value,
+            'has_cookie': True,
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
         })
+
     return result
 
 
@@ -1539,9 +1627,11 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
 
 @app.get("/cookie/{cid}/details")
 def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取账号详细信息（包括用户名、密码、显示浏览器设置）"""
+    """获取账号非敏感详情
+
+    安全基线：禁止返回闲鱼Cookie明文与账号密码明文。
+    """
     try:
-        # 检查cookie是否属于当前用户
         user_id = current_user['user_id']
         from db_manager import db_manager
         user_cookies = db_manager.get_all_cookies(user_id)
@@ -1549,13 +1639,20 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
-        # 获取详细信息
         details = db_manager.get_cookie_details(cid)
-        
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
-        
-        return details
+
+        return {
+            'id': details.get('id'),
+            'enabled': cookie_manager.manager.get_cookie_status(cid) if cookie_manager.manager else True,
+            'auto_confirm': details.get('auto_confirm', True),
+            'remark': details.get('remark', ''),
+            'pause_duration': details.get('pause_duration', 10),
+            'show_browser': details.get('show_browser', False),
+            'username': details.get('username', ''),
+            'has_cookie': True,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -2085,7 +2182,7 @@ async def get_account_face_verification_screenshot(
         username = current_user['username']
         
         # 如果是管理员，允许访问所有账号
-        is_admin = username == 'admin'
+        is_admin = bool(current_user.get('is_admin', False))
         
         if not is_admin:
             cookie_info = db_manager.get_cookie_details(account_id)
@@ -7157,7 +7254,7 @@ async def import_orders(
 # 然后由 React Router 在客户端处理路由
 
 # 定义不需要返回前端页面的路径前缀（API 路径）
-API_PREFIXES = ['/api/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
+API_PREFIXES = ['/api/', '/static/', '/assets', '/health', '/login', '/logout', '/verify', '/change-password', '/change-admin-password']
 
 @app.get('/{path:path}', response_class=HTMLResponse)
 async def catch_all_route(path: str):

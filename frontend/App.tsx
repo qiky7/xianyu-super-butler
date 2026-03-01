@@ -7,13 +7,14 @@ import CardList from './components/CardList';
 import ItemList from './components/ItemList';
 import Settings from './components/Settings';
 import Keywords from './components/Keywords';
-import { login, verifyToken } from './services/api';
-import { ShieldCheck, ArrowRight, Loader2, Sparkles, User, Lock, KeyRound } from 'lucide-react';
+import { login, verifySession } from './services/api';
+import { ShieldCheck, ArrowRight, Loader2, User, Lock, TerminalSquare } from 'lucide-react';
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [checkingAuth, setCheckingAuth] = useState(true);
+  const [needsInit, setNeedsInit] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
@@ -21,16 +22,20 @@ const App: React.FC = () => {
 
   // Check auth on mount
   useEffect(() => {
-      const token = localStorage.getItem('auth_token');
-      if (token) {
-          verifyToken()
-            .then(() => setIsLoggedIn(true))
-            .catch(() => localStorage.removeItem('auth_token'))
-            .finally(() => setCheckingAuth(false));
-      } else {
-          setCheckingAuth(false);
-      }
-      
+      verifySession()
+        .then((res) => {
+          if (res?.initialized === false) {
+            setNeedsInit(true);
+            setIsLoggedIn(false);
+            return;
+          }
+
+          setNeedsInit(false);
+          if (res?.authenticated) setIsLoggedIn(true);
+        })
+        .catch(() => setIsLoggedIn(false))
+        .finally(() => setCheckingAuth(false));
+
       const handleLogout = () => setIsLoggedIn(false);
       window.addEventListener('auth:logout', handleLogout);
       return () => window.removeEventListener('auth:logout', handleLogout);
@@ -43,27 +48,19 @@ const App: React.FC = () => {
       
       try {
           const res = await login({ username, password });
-          if (res.success && res.token) {
-              localStorage.setItem('auth_token', res.token);
+          if (res.success) {
               setIsLoggedIn(true);
           } else {
               setLoginError(res.message || '登录失败');
           }
       } catch (err) {
-          setLoginError('无法连接服务器');
+          const msg = err instanceof Error ? err.message : String(err);
+          setLoginError(msg || '登录失败');
       } finally {
           setLoginLoading(false);
       }
   };
 
-  const handleTestEntry = () => {
-      setLoginLoading(true);
-      setTimeout(() => {
-          localStorage.setItem('auth_token', 'test_token');
-          setIsLoggedIn(true);
-          setLoginLoading(false);
-      }, 800);
-  };
 
   if (checkingAuth) {
       return (
@@ -71,6 +68,46 @@ const App: React.FC = () => {
               <Loader2 className="w-8 h-8 text-[#FFE815] animate-spin" />
           </div>
       );
+  }
+
+  // Init Screen (system not initialized)
+  if (needsInit) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F4F5F7] p-4 relative overflow-hidden font-sans">
+        <div className="absolute top-[-10%] left-[-10%] w-[60%] h-[60%] bg-yellow-200/40 rounded-full blur-[120px] animate-pulse"></div>
+        <div className="absolute bottom-[-10%] right-[-10%] w-[60%] h-[60%] bg-blue-200/30 rounded-full blur-[120px] animate-pulse" style={{animationDelay: '2s'}}></div>
+
+        <div className="bg-white/80 backdrop-blur-3xl p-8 md:p-12 rounded-[3rem] shadow-[0_20px_60px_-15px_rgba(0,0,0,0.05)] w-full max-w-xl border border-white relative z-10 animate-fade-in">
+          <div className="text-center mb-8">
+            <div className="w-24 h-24 bg-[#FFE815] rounded-[2rem] flex items-center justify-center shadow-xl shadow-yellow-200 mx-auto mb-6 transform rotate-[-6deg] transition-all duration-500">
+              <TerminalSquare className="w-10 h-10 text-black" />
+            </div>
+            <h2 className="text-3xl font-extrabold text-gray-900 mb-2 tracking-tight">系统尚未初始化</h2>
+            <p className="text-gray-600 font-medium">为避免默认口令风险，管理员必须通过服务器本机 CLI 初始化。</p>
+          </div>
+
+          <div className="space-y-4">
+            <div className="p-4 rounded-2xl bg-gray-50 border border-gray-100">
+              <div className="text-sm font-bold text-gray-900 mb-2">请在服务器上执行：</div>
+              <pre className="text-xs bg-black text-white p-4 rounded-2xl overflow-x-auto">python3 init_admin.py</pre>
+              <div className="text-xs text-gray-500 mt-2">完成后刷新页面即可进入登录。</div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="w-full ios-btn-primary h-14 rounded-2xl text-lg shadow-xl shadow-yellow-200 mt-2 flex items-center justify-center gap-2 group"
+            >
+              我已初始化，刷新 <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+            </button>
+          </div>
+
+          <div className="mt-8 pt-6 border-t border-gray-100 text-center">
+            <span className="text-xs text-gray-400 font-medium tracking-widest uppercase">Secure Bootstrap</span>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   // Login Screen Component
@@ -132,15 +169,6 @@ const App: React.FC = () => {
           </form>
           
           <div className="mt-8 pt-6 border-t border-gray-100">
-             <button 
-                type="button"
-                onClick={handleTestEntry}
-                disabled={loginLoading}
-                className="w-full bg-black text-white h-14 rounded-2xl text-base font-bold shadow-lg shadow-gray-200 flex items-center justify-center gap-2 hover:bg-gray-800 transition-all active:scale-95"
-             >
-                <KeyRound className="w-5 h-5 text-[#FFE815]" />
-                游客试用 (无需账号)
-             </button>
              <div className="mt-6 text-center">
                  <span className="text-xs text-gray-400 font-medium tracking-widest uppercase">
                     Xianyu Auto-Dispatch Pro v2.5
@@ -172,9 +200,8 @@ const App: React.FC = () => {
         activeTab={activeTab} 
         setActiveTab={setActiveTab} 
         onLogout={() => {
-            localStorage.removeItem('auth_token');
             setIsLoggedIn(false);
-        }} 
+        }}
       />
       
       <main className="flex-1 ml-64 p-8 md:p-12 overflow-y-auto h-screen relative scroll-smooth">

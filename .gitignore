@@ -806,3 +806,9 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/coverage/
+
+# ai工具链
+.trellis
+.spec-workflow
+.cursor
+.claude

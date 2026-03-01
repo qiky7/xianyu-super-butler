@@ -1,4 +1,4 @@
-import { get, post, put, del } from '../lib/request';
+import { get, post, put, del } from '../request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
@@ -10,7 +10,7 @@ export const login = async (data: { username?: string; password?: string; email?
   return post('/login', data);
 };
 
-export const verifyToken = async (): Promise<{ authenticated: boolean; user_id?: number; username?: string }> => {
+export const verifySession = async (): Promise<{ authenticated: boolean; initialized?: boolean; user_id?: number; username?: string; is_admin?: boolean }> => {
   return get('/verify');
 };
 
@@ -25,22 +25,21 @@ export const changePassword = async (currentPassword: string, newPassword: strin
 // Accounts
 export const getAccountDetails = async (): Promise<AccountDetail[]> => {
   const data = await get<any[]>('/cookies/details');
-  // Map backend fields to UI fields if necessary
   return data.map(item => ({
     id: item.id,
-    value: item.value,
-    cookie: item.value,
+    value: '',
+    cookie: '',
     enabled: item.enabled,
     auto_confirm: item.auto_confirm,
     remark: item.remark,
     note: item.remark,
     pause_duration: item.pause_duration,
-    username: item.username,
-    login_password: item.login_password,
+    username: item.username || '',
+    login_password: '',
     show_browser: item.show_browser,
-    nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
-    avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`, // Placeholder avatar
-    ai_enabled: false, // 需要从AI设置API获取
+    nickname: item.remark || `Account ${item.id.substring(0,6)}`,
+    avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`,
+    ai_enabled: false,
   }));
 };
 
@@ -134,13 +133,10 @@ export const syncOrders = async (cookieId?: string, status?: string): Promise<an
   if (cookieId) formData.append('cookie_id', cookieId);
   if (status) formData.append('status', status);
 
-  // 使用 fetch 来发送 FormData
-  const token = localStorage.getItem('auth_token');
+  // 使用 fetch 来发送 FormData（Cookie 会话，自动携带凭证）
   const response = await fetch('/api/orders/refresh', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`
-    },
+    credentials: 'include',
     body: formData
   });
   return response.json();
@@ -162,9 +158,9 @@ export const importOrders = async (data: Partial<Order>[] | FormData): Promise<a
   const isFormData = data instanceof FormData;
   const response = await fetch('/api/orders/import', {
     method: 'POST',
+    credentials: 'include',
     headers: {
       ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-      'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
     },
     body: isFormData ? data : JSON.stringify(data)
   });
