@@ -22,6 +22,38 @@ export const changePassword = async (currentPassword: string, newPassword: strin
   return post('/change-password', { current_password: currentPassword, new_password: newPassword });
 };
 
+// Password Login (账号密码登录)
+export interface PasswordLoginRequest {
+  account_id: string;
+  account: string;
+  password: string;
+  show_browser?: boolean;
+}
+
+export interface PasswordLoginResponse {
+  success: boolean;
+  session_id?: string;
+  status?: string;
+  message?: string;
+}
+
+export interface PasswordLoginStatusResponse {
+  status: 'idle' | 'processing' | 'verification_required' | 'success' | 'failed' | 'not_found';
+  message?: string;
+  verification_url?: string | null;
+  screenshot_path?: string | null;
+  qr_code_url?: string | null;
+  error?: string;
+}
+
+export const passwordLogin = async (data: PasswordLoginRequest): Promise<PasswordLoginResponse> => {
+  return post('/password-login', data);
+};
+
+export const checkPasswordLoginStatus = async (sessionId: string): Promise<PasswordLoginStatusResponse> => {
+  return get(`/password-login/check/${sessionId}`);
+};
+
 // Accounts
 export const getAccountDetails = async (): Promise<AccountDetail[]> => {
   const data = await get<any[]>('/cookies/details');
