@@ -80,7 +80,7 @@
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/Mxucc/xianyu-super-butler.git
+git clone https://github.com/qiky7/xianyu-super-butler.git
 cd xianyu-super-butler
 
 # 2. 安装依赖
