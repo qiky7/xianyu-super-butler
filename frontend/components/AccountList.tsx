@@ -14,12 +14,14 @@ import {
   updateAccountLoginInfo,
   updateAccountAISettings,
   getAllAISettings,
-  getAccountAISettings
+  getAccountAISettings,
+  passwordLogin,
+  checkPasswordLoginStatus
 } from '../services/api';
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Upload, Key, Eye, EyeOff, Bot, Settings
+  Upload, Key, Eye, EyeOff, Bot, Settings, Lock
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -32,6 +34,21 @@ const AccountList: React.FC = () => {
   const [qrStatus, setQrStatus] = useState<string>('pending');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
+  
+  // 密码登录状态
+  const [showPasswordLoginModal, setShowPasswordLoginModal] = useState(false);
+  const [passwordLoginForm, setPasswordLoginForm] = useState({
+    account_id: '',
+    account: '',
+    password: '',
+    show_browser: false,
+    showPassword: false,
+  });
+  const [passwordLoginStatus, setPasswordLoginStatus] = useState<string>('idle');
+  const [passwordLoginMessage, setPasswordLoginMessage] = useState<string>('');
+  const [passwordLoginSessionId, setPasswordLoginSessionId] = useState<string>('');
+  const [passwordLoginVerificationUrl, setPasswordLoginVerificationUrl] = useState<string>('');
+  const [passwordLoginScreenshot, setPasswordLoginScreenshot] = useState<string>('');
 
   // 编辑表单状态
   const [editForm, setEditForm] = useState({
@@ -233,6 +250,82 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const startPasswordLogin = async () => {
+    setShowPasswordLoginModal(true);
+    setPasswordLoginStatus('idle');
+    setPasswordLoginMessage('');
+    setPasswordLoginVerificationUrl('');
+    setPasswordLoginScreenshot('');
+  };
+
+  const handlePasswordLoginSubmit = async () => {
+    if (!passwordLoginForm.account || !passwordLoginForm.password) {
+      alert('请输入账号和密码');
+      return;
+    }
+    
+    setPasswordLoginStatus('processing');
+    setPasswordLoginMessage('正在登录...');
+    
+    try {
+      const res = await passwordLogin({
+        account_id: passwordLoginForm.account_id || `pwd_${Date.now()}`,
+        account: passwordLoginForm.account,
+        password: passwordLoginForm.password,
+        show_browser: passwordLoginForm.show_browser,
+      });
+      
+      if (res.success && res.session_id) {
+        setPasswordLoginSessionId(res.session_id);
+        setPasswordLoginStatus('processing');
+        setPasswordLoginMessage(res.message || '登录中，请稍候...');
+        
+        // 轮询检查登录状态
+        const interval = setInterval(async () => {
+          try {
+            const statusRes = await checkPasswordLoginStatus(res.session_id!);
+            
+            if (statusRes.status === 'success') {
+              clearInterval(interval);
+              setPasswordLoginStatus('success');
+              setPasswordLoginMessage('登录成功！');
+              setTimeout(() => {
+                setShowPasswordLoginModal(false);
+                loadAccounts();
+              }, 1500);
+            } else if (statusRes.status === 'verification_required') {
+              clearInterval(interval);
+              setPasswordLoginStatus('verification_required');
+              setPasswordLoginMessage('需要人脸验证，请点击下方链接完成验证');
+              if (statusRes.verification_url) {
+                setPasswordLoginVerificationUrl(statusRes.verification_url);
+              }
+              if (statusRes.screenshot_path) {
+                setPasswordLoginScreenshot(statusRes.screenshot_path);
+              }
+            } else if (statusRes.status === 'failed' || statusRes.status === 'error') {
+              clearInterval(interval);
+              setPasswordLoginStatus('error');
+              setPasswordLoginMessage(statusRes.message || '登录失败');
+            } else if (statusRes.status === 'not_found') {
+              clearInterval(interval);
+              setPasswordLoginStatus('error');
+              setPasswordLoginMessage('登录会话不存在或已过期');
+            }
+          } catch (err) {
+            console.error('检查登录状态失败:', err);
+          }
+        }, 3000);
+      } else {
+        setPasswordLoginStatus('error');
+        setPasswordLoginMessage(res.message || '登录失败');
+      }
+    } catch (err) {
+      setPasswordLoginStatus('error');
+      setPasswordLoginMessage(err instanceof Error ? err.message : '登录失败');
+    }
+  };
+
   if (loading) return <div className="p-20 flex justify-center"><Loader2 className="w-8 h-8 text-[#FFE815] animate-spin"/></div>;
 
   return (
@@ -242,13 +335,22 @@ const AccountList: React.FC = () => {
           <h2 className="text-4xl font-extrabold text-gray-900 tracking-tight">账号管理</h2>
           <p className="text-gray-500 mt-2 font-medium">管理您的闲鱼授权账号及设置。</p>
         </div>
-        <button
-            onClick={startQRLogin}
-            className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 transition-transform hover:scale-105 active:scale-95"
-        >
-          <QrCode className="w-5 h-5" />
-          扫码添加新账号
-        </button>
+        <div className="flex gap-3">
+          <button
+              onClick={startPasswordLogin}
+              className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl font-bold shadow-lg shadow-amber-200 transition-transform hover:scale-105 active:scale-95"
+          >
+            <Lock className="w-5 h-5" />
+            密码登录
+          </button>
+          <button
+              onClick={startQRLogin}
+              className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 transition-transform hover:scale-105 active:scale-95"
+          >
+            <QrCode className="w-5 h-5" />
+            扫码添加新账号
+          </button>
+        </div>
       </div>
 
       {/* Account Grid */}
@@ -324,7 +426,7 @@ const AccountList: React.FC = () => {
                     <User className="w-10 h-10 text-gray-400" />
                 </div>
                 <h3 className="text-lg font-bold text-gray-900">暂无账号</h3>
-                <p className="text-gray-500 mt-1">请点击右上角扫码添加您的闲鱼账号</p>
+                <p className="text-gray-500 mt-1">请点击右上角使用密码登录或扫码添加您的闲鱼账号</p>
             </div>
         )}
       </div>
@@ -366,6 +468,148 @@ const AccountList: React.FC = () => {
 
                           <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl">二维码有效期为5分钟，请尽快扫码。</p>
                       </div>
+                  </div>
+              </div>
+          </div>,
+          document.body
+      )}
+
+      {/* 密码登录弹窗 */}
+      {showPasswordLoginModal && createPortal(
+          <div className="modal-overlay-centered">
+              <div className="modal-container" style={{maxWidth: '28rem'}}>
+                  <button
+                    onClick={() => setShowPasswordLoginModal(false)}
+                    className="self-end p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors mb-6"
+                  >
+                    <X className="w-5 h-5 text-gray-600" />
+                  </button>
+
+                  <div className="modal-body">
+                      <div className="text-center mb-6">
+                          <h3 className="text-2xl font-extrabold text-gray-900 mb-2">密码登录</h3>
+                          <p className="text-gray-500 font-medium">输入闲鱼账号密码进行登录</p>
+                      </div>
+
+                      {passwordLoginStatus === 'idle' || passwordLoginStatus === 'processing' ? (
+                          <div className="space-y-4">
+                              <div>
+                                  <label className="block text-sm font-bold text-gray-700 mb-2 text-left">闲鱼账号</label>
+                                  <input
+                                      type="text"
+                                      value={passwordLoginForm.account}
+                                      onChange={(e) => setPasswordLoginForm({ ...passwordLoginForm, account: e.target.value })}
+                                      placeholder="手机号或用户名"
+                                      className="w-full ios-input px-4 py-3 rounded-xl"
+                                      disabled={passwordLoginStatus === 'processing'}
+                                  />
+                              </div>
+                              <div>
+                                  <label className="block text-sm font-bold text-gray-700 mb-2 text-left">登录密码</label>
+                                  <div className="relative">
+                                      <input
+                                          type={passwordLoginForm.showPassword ? 'text' : 'password'}
+                                          value={passwordLoginForm.password}
+                                          onChange={(e) => setPasswordLoginForm({ ...passwordLoginForm, password: e.target.value })}
+                                          placeholder="请输入密码"
+                                          className="w-full ios-input px-4 py-3 rounded-xl pr-12"
+                                          disabled={passwordLoginStatus === 'processing'}
+                                      />
+                                      <button
+                                          type="button"
+                                          onClick={() => setPasswordLoginForm({ ...passwordLoginForm, showPassword: !passwordLoginForm.showPassword })}
+                                          className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                                          disabled={passwordLoginStatus === 'processing'}
+                                      >
+                                          {passwordLoginForm.showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                                      </button>
+                                  </div>
+                              </div>
+                              <div className="flex items-center justify-between">
+                                  <div>
+                                      <div className="font-bold text-gray-900">登录时显示浏览器</div>
+                                      <div className="text-xs text-gray-500">调试时可开启查看登录过程</div>
+                                  </div>
+                                  <button
+                                      type="button"
+                                      onClick={() => setPasswordLoginForm({ ...passwordLoginForm, show_browser: !passwordLoginForm.show_browser })}
+                                      className={`w-14 h-8 rounded-full transition-colors duration-300 relative ${
+                                          passwordLoginForm.show_browser ? 'bg-[#FFE815]' : 'bg-gray-300'
+                                      }`}
+                                      disabled={passwordLoginStatus === 'processing'}
+                                  >
+                                      <span
+                                          className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow-md transition-transform duration-300 ${
+                                              passwordLoginForm.show_browser ? 'translate-x-7' : 'translate-x-1'
+                                          }`}
+                                      />
+                                  </button>
+                              </div>
+                              {passwordLoginStatus === 'processing' && (
+                                  <div className="flex items-center justify-center gap-2 text-[#FFE815]">
+                                      <Loader2 className="w-5 h-5 animate-spin" />
+                                      <span className="font-bold">正在登录，请稍候...</span>
+                                  </div>
+                              )}
+                              <button
+                                  onClick={handlePasswordLoginSubmit}
+                                  disabled={passwordLoginStatus === 'processing'}
+                                  className="w-full ios-btn-primary py-3 rounded-xl font-bold flex items-center justify-center gap-2 disabled:opacity-50"
+                              >
+                                  {passwordLoginStatus === 'processing' ? <Loader2 className="w-5 h-5 animate-spin" /> : <Lock className="w-5 h-5" />}
+                                  {passwordLoginStatus === 'processing' ? '登录中...' : '开始登录'}
+                              </button>
+                          </div>
+                      ) : passwordLoginStatus === 'verification_required' ? (
+                          <div className="text-center">
+                              <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                  <Lock className="w-8 h-8 text-amber-600" />
+                              </div>
+                              <h4 className="text-lg font-bold text-gray-900 mb-2">需要人脸验证</h4>
+                              <p className="text-gray-500 mb-4">{passwordLoginMessage}</p>
+                              {passwordLoginVerificationUrl && (
+                                  <a
+                                      href={passwordLoginVerificationUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="inline-block ios-btn-primary px-6 py-3 rounded-xl font-bold mb-4"
+                                  >
+                                      点击此处进行人脸验证
+                                  </a>
+                              )}
+                              {passwordLoginScreenshot && (
+                                  <div className="mt-4">
+                                      <img src={passwordLoginScreenshot} alt="验证截图" className="w-full rounded-xl border-2 border-gray-200" />
+                                  </div>
+                              )}
+                              <p className="text-xs text-gray-400 mt-4">完成验证后，系统将自动检测登录状态</p>
+                          </div>
+                      ) : passwordLoginStatus === 'success' ? (
+                          <div className="text-center">
+                              <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                  <Check className="w-8 h-8 text-green-600" />
+                              </div>
+                              <h4 className="text-lg font-bold text-gray-900 mb-2">登录成功</h4>
+                              <p className="text-gray-500">{passwordLoginMessage}</p>
+                          </div>
+                      ) : (
+                          <div className="text-center">
+                              <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                  <X className="w-8 h-8 text-red-600" />
+                              </div>
+                              <h4 className="text-lg font-bold text-gray-900 mb-2">登录失败</h4>
+                              <p className="text-gray-500 mb-4">{passwordLoginMessage}</p>
+                              <button
+                                  onClick={() => {
+                                      setPasswordLoginStatus('idle');
+                                      setPasswordLoginMessage('');
+                                  }}
+                                  className="ios-btn-primary px-6 py-2 rounded-xl font-bold"
+                              >
+                                  返回重试
+                              </button>
+                          </div>
+                      )}
                   </div>
               </div>
           </div>,
