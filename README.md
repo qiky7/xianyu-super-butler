@@ -84,6 +84,8 @@ git clone https://github.com/qiky7/xianyu-super-butler.git
 cd xianyu-super-butler
 
 # 2. 安装依赖
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 
 # 3. 构建前端（改成 pnpm 了）
